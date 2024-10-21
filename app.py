@@ -38,6 +38,10 @@ def convert_pdf_to_images(pdf_bytes, dpi=300, output_format="PNG"):
             "traceback": traceback.format_exc()
         }
 
+@app.route('/')
+def home():
+    return "PDF Converter Microservice is running!"
+
 @app.route('/convert', methods=['POST'])
 def handle_convert():
     if 'file' not in request.files:
