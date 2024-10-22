@@ -7,136 +7,107 @@ from flask import Flask, request, jsonify
 import os
 import gc
 import psutil
-from typing import List, Dict, Optional
+from typing import Optional
 from dataclasses import dataclass
-import mmap
-from contextlib import contextmanager
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB limit
 
 @dataclass
-class ProcessingSettings:
-    dpi: int = 300
-    max_dimension: int = 2400
-    format: str = "PNG"
-    chunk_size: int = 50 * 1024 * 1024  # 50MB chunks for processing
+class QualitySettings:
+    dpi: int = 300               # Maintain 300 DPI for high quality
+    format: str = "PNG"          # Use PNG for lossless quality
+    max_dimension: int = 4096    # Allow larger dimensions for detail
+    optimize: bool = True        # Optimize without quality loss
 
-@contextmanager
-def memory_tracker(label: str):
-    """Track memory usage within a context"""
+def cleanup_memory():
     gc.collect()
+
+def get_memory_usage_mb() -> float:
     process = psutil.Process(os.getpid())
-    start_mem = process.memory_info().rss / 1024 / 1024
-    print(f"{label} - Starting memory: {start_mem:.1f}MB")
+    return process.memory_info().rss / 1024 / 1024
+
+def process_single_page(pdf_bytes: bytes, page_num: int, settings: QualitySettings) -> Optional[dict]:
+    """Process a single page from PDF with high quality settings"""
+    doc = None
     try:
-        yield
-    finally:
-        gc.collect()
-        end_mem = process.memory_info().rss / 1024 / 1024
-        print(f"{label} - Ending memory: {end_mem:.1f}MB (Change: {end_mem - start_mem:.1f}MB)")
-
-def create_memory_mapped_buffer(size: int) -> mmap.mmap:
-    """Create a memory-mapped buffer for large data handling"""
-    fd = os.open('/tmp', os.O_TMPFILE | os.O_RDWR, 0o600)
-    os.write(fd, b'\0' * size)
-    buffer = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
-    os.close(fd)
-    return buffer
-
-def process_page(page: fitz.Page, settings: ProcessingSettings) -> Optional[str]:
-    """Process single page with optimized memory usage"""
-    with memory_tracker(f"Page {page.number + 1}"):
-        try:
-            # Calculate optimal scale
-            width, height = page.rect.width, page.rect.height
-            scale = min(settings.max_dimension / max(width, height), 1.0) * (settings.dpi/72)
-            matrix = fitz.Matrix(scale, scale)
-            
-            # Get pixmap in chunks
-            with memory_tracker("Pixmap creation"):
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
-            
-            # Create memory-mapped buffer for large images
-            buffer_size = pix.width * pix.height * 3 + 1024 * 1024  # Add 1MB padding
-            with memory_tracker("Image processing"):
-                # Use memory-mapped file for large data
-                with create_memory_mapped_buffer(buffer_size) as mm:
-                    # Convert to PIL Image using memory-mapped buffer
-                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    
-                    # Free pixmap memory immediately
-                    del pix
-                    gc.collect()
-                    
-                    # Use BytesIO with memory-mapped backend
-                    bio = io.BytesIO(mm)
-                    img.save(bio, format=settings.format, optimize=True)
-                    
-                    # Get base64 in chunks
-                    bio.seek(0)
-                    b64_str = base64.b64encode(bio.read()).decode()
-                    
-                    # Cleanup
-                    del img
-                    bio.close()
-                    
-            gc.collect()
-            return b64_str
-            
-        except Exception as e:
-            print(f"Error processing page {page.number + 1}: {str(e)}")
-            traceback.print_exc()
-            return None
-
-def convert_pdf_to_images(pdf_bytes: bytes) -> Dict:
-    """Convert PDF to images with optimized memory handling"""
-    images: List[str] = []
-    settings = ProcessingSettings()
-    
-    with memory_tracker("PDF Processing"):
-        try:
-            # Open document with memory tracking
-            with memory_tracker("Document loading"):
-                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                total_pages = len(doc)
-            
-            # Process each page
-            for page_num in range(total_pages):
-                with memory_tracker(f"Full page {page_num + 1} processing"):
-                    try:
-                        # Load and process single page
-                        page = doc.load_page(page_num)
-                        img_str = process_page(page, settings)
-                        
-                        if img_str:
-                            images.append(img_str)
-                        else:
-                            images.append("")
-                        
-                        # Explicit cleanup
-                        del page
-                        gc.collect()
-                        
-                    except Exception as e:
-                        print(f"Error on page {page_num + 1}: {str(e)}")
-                        images.append("")
-                        gc.collect()
-                        
-            doc.close()
+        cleanup_memory()
+        print(f"Memory before processing page {page_num}: {get_memory_usage_mb():.1f}MB")
+        
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
+        
+        if page_num >= total_pages:
             return {
-                "images": images,
+                "error": "Page number exceeds document length",
                 "total_pages": total_pages
             }
-            
-        except Exception as e:
-            return {
-                "error": str(e),
-                "traceback": traceback.format_exc()
-            }
+        
+        # Process with high quality settings
+        page = doc.load_page(page_num)
+        
+        # Use exact DPI scaling
+        scale = settings.dpi / 72  # Convert from PDF points to pixels
+        matrix = fitz.Matrix(scale, scale)
+        
+        # Get high-quality pixmap
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        
+        # Only resize if absolutely necessary for memory constraints
+        if max(img.width, img.height) > settings.max_dimension:
+            ratio = settings.max_dimension / max(img.width, img.height)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # Save with lossless settings
+        buffer = io.BytesIO()
+        if settings.format == "PNG":
+            img.save(
+                buffer,
+                format="PNG",
+                optimize=settings.optimize,
+            )
+        else:
+            img.save(
+                buffer,
+                format="JPEG",
+                quality=100,  # Maximum quality if JPEG is used
+                optimize=settings.optimize
+            )
+        
+        img_str = base64.b64encode(buffer.getvalue()).decode()
+        
+        # Cleanup
+        del pix
+        del img
+        buffer.close()
+        cleanup_memory()
+        
+        print(f"Memory after processing page {page_num}: {get_memory_usage_mb():.1f}MB")
+        
+        return {
+            "image": img_str,
+            "page_number": page_num,
+            "total_pages": total_pages,
+            "width": img.width,
+            "height": img.height,
+            "dpi": settings.dpi
+        }
+        
+    except Exception as e:
+        print(f"Error processing page {page_num}: {str(e)}")
+        return {
+            "error": str(e),
+            "page_number": page_num
+        }
+    finally:
+        if doc:
+            doc.close()
+        cleanup_memory()
 
-@app.route('/convert', methods=['POST'])
-def handle_convert():
+@app.route('/convert/<int:page_num>', methods=['POST'])
+def handle_convert_page(page_num):
     if 'file' not in request.files:
         return jsonify({"error": "No file part"}), 400
     
@@ -144,17 +115,22 @@ def handle_convert():
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
     
+    # Use high quality settings
+    settings = QualitySettings(
+        dpi=300,          # Maintain 300 DPI
+        format="PNG",     # Use PNG for lossless quality
+        max_dimension=4096  # Allow large dimensions
+    )
+    
     try:
-        # Process in memory-tracked context
-        with memory_tracker("Full request"):
-            pdf_bytes = file.read()
-            result = convert_pdf_to_images(pdf_bytes)
+        pdf_bytes = file.read()
+        result = process_single_page(pdf_bytes, page_num, settings)
+        
+        if "error" in result:
+            return jsonify(result), 500
             
-            if "error" in result:
-                return jsonify(result), 500
-                
-            return jsonify(result)
-            
+        return jsonify(result)
+        
     except Exception as e:
         return jsonify({
             "error": "PDF processing failed",
