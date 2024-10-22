@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify
 import os
 import gc
 import psutil
-from typing import Optional
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
 app = Flask(__name__)
@@ -15,25 +15,50 @@ app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB limit
 
 @dataclass
 class QualitySettings:
-    dpi: int = 300               # Maintain 300 DPI for high quality
-    format: str = "PNG"          # Use PNG for lossless quality
-    max_dimension: int = 4096    # Allow larger dimensions for detail
-    optimize: bool = True        # Optimize without quality loss
-
-def cleanup_memory():
-    gc.collect()
+    dpi: int = 300
+    format: str = "PNG"
+    max_dimension: int = 4096
+    optimize: bool = True
 
 def get_memory_usage_mb() -> float:
     process = psutil.Process(os.getpid())
     return process.memory_info().rss / 1024 / 1024
 
-def process_single_page(pdf_bytes: bytes, page_num: int, settings: QualitySettings) -> Optional[dict]:
-    """Process a single page from PDF with high quality settings"""
-    doc = None
+def cleanup_memory():
+    gc.collect()
+
+def process_page_to_image(page: fitz.Page, settings: QualitySettings) -> Tuple[Image.Image, int, int]:
+    """Convert PDF page to PIL Image with error handling"""
+    scale = settings.dpi / 72
+    matrix = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    
     try:
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        width, height = img.size
+        
+        if max(width, height) > settings.max_dimension:
+            ratio = settings.max_dimension / max(width, height)
+            new_size = (int(width * ratio), int(height * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+            width, height = img.size
+            
+        return img, width, height
+    finally:
+        # Ensure pixmap is cleaned up
+        del pix
         cleanup_memory()
+
+def process_single_page(pdf_bytes: bytes, page_num: int, settings: QualitySettings) -> dict:
+    """Process a single page with proper cleanup"""
+    doc = None
+    img = None
+    buffer = None
+    
+    try:
         print(f"Memory before processing page {page_num}: {get_memory_usage_mb():.1f}MB")
         
+        # Open document
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         total_pages = len(doc)
         
@@ -43,46 +68,14 @@ def process_single_page(pdf_bytes: bytes, page_num: int, settings: QualitySettin
                 "total_pages": total_pages
             }
         
-        # Process with high quality settings
+        # Load and process page
         page = doc.load_page(page_num)
+        img, width, height = process_page_to_image(page, settings)
         
-        # Use exact DPI scaling
-        scale = settings.dpi / 72  # Convert from PDF points to pixels
-        matrix = fitz.Matrix(scale, scale)
-        
-        # Get high-quality pixmap
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        
-        # Only resize if absolutely necessary for memory constraints
-        if max(img.width, img.height) > settings.max_dimension:
-            ratio = settings.max_dimension / max(img.width, img.height)
-            new_size = (int(img.width * ratio), int(img.height * ratio))
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
-        
-        # Save with lossless settings
+        # Convert to base64
         buffer = io.BytesIO()
-        if settings.format == "PNG":
-            img.save(
-                buffer,
-                format="PNG",
-                optimize=settings.optimize,
-            )
-        else:
-            img.save(
-                buffer,
-                format="JPEG",
-                quality=100,  # Maximum quality if JPEG is used
-                optimize=settings.optimize
-            )
-        
+        img.save(buffer, format=settings.format, optimize=settings.optimize)
         img_str = base64.b64encode(buffer.getvalue()).decode()
-        
-        # Cleanup
-        del pix
-        del img
-        buffer.close()
-        cleanup_memory()
         
         print(f"Memory after processing page {page_num}: {get_memory_usage_mb():.1f}MB")
         
@@ -90,21 +83,30 @@ def process_single_page(pdf_bytes: bytes, page_num: int, settings: QualitySettin
             "image": img_str,
             "page_number": page_num,
             "total_pages": total_pages,
-            "width": img.width,
-            "height": img.height,
+            "width": width,
+            "height": height,
             "dpi": settings.dpi
         }
         
     except Exception as e:
         print(f"Error processing page {page_num}: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
         return {
             "error": str(e),
-            "page_number": page_num
+            "page_number": page_num,
+            "traceback": traceback.format_exc()
         }
+        
     finally:
+        # Cleanup in reverse order of creation
+        if buffer:
+            buffer.close()
+        if img:
+            del img
         if doc:
             doc.close()
         cleanup_memory()
+        print(f"Final memory after cleanup: {get_memory_usage_mb():.1f}MB")
 
 @app.route('/convert/<int:page_num>', methods=['POST'])
 def handle_convert_page(page_num):
@@ -115,12 +117,7 @@ def handle_convert_page(page_num):
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
     
-    # Use high quality settings
-    settings = QualitySettings(
-        dpi=300,          # Maintain 300 DPI
-        format="PNG",     # Use PNG for lossless quality
-        max_dimension=4096  # Allow large dimensions
-    )
+    settings = QualitySettings()
     
     try:
         pdf_bytes = file.read()
@@ -134,7 +131,8 @@ def handle_convert_page(page_num):
     except Exception as e:
         return jsonify({
             "error": "PDF processing failed",
-            "details": str(e)
+            "details": str(e),
+            "traceback": traceback.format_exc()
         }), 500
 
 if __name__ == "__main__":
