@@ -1,140 +1,146 @@
-import fitz
-import base64
-import io
-from PIL import Image
-import traceback
-from flask import Flask, request, jsonify
 import os
 import gc
+import fitz
+import base64
+from PIL import Image
+import io
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import time
+import logging
 import psutil
-from typing import Optional, Tuple
-from dataclasses import dataclass
+import sys
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB limit
+CORS(app)
 
-@dataclass
-class QualitySettings:
-    dpi: int = 300
-    format: str = "PNG"
-    max_dimension: int = 4096
-    optimize: bool = True
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def get_memory_usage_mb() -> float:
+def log_memory_usage(message):
+    """Log current memory usage with a custom message"""
     process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1024 / 1024
+    memory_mb = process.memory_info().rss / 1024 / 1024
+    logger.info(f"{message}: {memory_mb:.1f}MB")
 
-def cleanup_memory():
+def cleanup_resources():
+    """Force garbage collection and clear memory"""
     gc.collect()
+    if hasattr(sys, 'set_asyncgen_hooks'):
+        sys.set_asyncgen_hooks(None)
+    log_memory_usage("Memory after cleanup")
 
-def process_page_to_image(page: fitz.Page, settings: QualitySettings) -> Tuple[Image.Image, int, int]:
-    """Convert PDF page to PIL Image with error handling"""
-    scale = settings.dpi / 72
-    matrix = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=matrix, alpha=False)
-    
+def convert_page_to_images(pdf_data, page_number):
+    """Convert a single PDF page to image with memory management"""
     try:
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        width, height = img.size
+        log_memory_usage(f"Memory before processing page {page_number}")
         
-        if max(width, height) > settings.max_dimension:
-            ratio = settings.max_dimension / max(width, height)
-            new_size = (int(width * ratio), int(height * ratio))
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
-            width, height = img.size
+        # Create a temporary file for the PDF data
+        temp_pdf_path = f"temp_pdf_{page_number}.pdf"
+        with open(temp_pdf_path, "wb") as pdf_file:
+            pdf_file.write(pdf_data)
+        
+        # Open PDF and process single page
+        pdf_document = fitz.open(temp_pdf_path)
+        
+        if page_number >= pdf_document.page_count:
+            pdf_document.close()
+            os.remove(temp_pdf_path)
+            return None
             
-        return img, width, height
-    finally:
-        # Ensure pixmap is cleaned up
-        del pix
-        cleanup_memory()
-
-def process_single_page(pdf_bytes: bytes, page_num: int, settings: QualitySettings) -> dict:
-    """Process a single page with proper cleanup"""
-    doc = None
-    img = None
-    buffer = None
-    
-    try:
-        print(f"Memory before processing page {page_num}: {get_memory_usage_mb():.1f}MB")
+        page = pdf_document[page_number]
+        pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72))
         
-        # Open document
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        total_pages = len(doc)
-        
-        if page_num >= total_pages:
-            return {
-                "error": "Page number exceeds document length",
-                "total_pages": total_pages
-            }
-        
-        # Load and process page
-        page = doc.load_page(page_num)
-        img, width, height = process_page_to_image(page, settings)
+        # Convert to PIL Image
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         
         # Convert to base64
-        buffer = io.BytesIO()
-        img.save(buffer, format=settings.format, optimize=settings.optimize)
-        img_str = base64.b64encode(buffer.getvalue()).decode()
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='PNG', optimize=True)
+        img_byte_arr = img_byte_arr.getvalue()
+        img_base64 = base64.b64encode(img_byte_arr).decode('utf-8')
         
-        print(f"Memory after processing page {page_num}: {get_memory_usage_mb():.1f}MB")
+        # Cleanup
+        pdf_document.close()
+        os.remove(temp_pdf_path)
+        del pix
+        del img
         
-        return {
-            "image": img_str,
-            "page_number": page_num,
-            "total_pages": total_pages,
-            "width": width,
-            "height": height,
-            "dpi": settings.dpi
-        }
+        log_memory_usage(f"Memory after processing page {page_number}")
+        cleanup_resources()
+        
+        return img_base64
         
     except Exception as e:
-        print(f"Error processing page {page_num}: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        return {
-            "error": str(e),
-            "page_number": page_num,
-            "traceback": traceback.format_exc()
-        }
-        
-    finally:
-        # Cleanup in reverse order of creation
-        if buffer:
-            buffer.close()
-        if img:
-            del img
-        if doc:
-            doc.close()
-        cleanup_memory()
-        print(f"Final memory after cleanup: {get_memory_usage_mb():.1f}MB")
+        logger.error(f"Error processing page {page_number}: {str(e)}")
+        cleanup_resources()
+        return None
 
-@app.route('/convert/<int:page_num>', methods=['POST'])
-def handle_convert_page(page_num):
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
-    
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-    
-    settings = QualitySettings()
-    
+@app.route('/convert/<int:page_number>', methods=['POST'])
+def convert_pdf_page(page_number):
+    """Endpoint to convert a specific PDF page to image"""
     try:
-        pdf_bytes = file.read()
-        result = process_single_page(pdf_bytes, page_num, settings)
-        
-        if "error" in result:
-            return jsonify(result), 500
-            
-        return jsonify(result)
-        
-    except Exception as e:
-        return jsonify({
-            "error": "PDF processing failed",
-            "details": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+        pdf_file = request.files['file']
+        if not pdf_file.filename.endswith('.pdf'):
+            return jsonify({'error': 'File must be a PDF'}), 400
+
+        # Read PDF data
+        pdf_data = pdf_file.read()
+        
+        # Process single page
+        result = convert_page_to_images(pdf_data, page_number)
+        
+        if result is None:
+            return jsonify({'error': f'Page {page_number} could not be processed'}), 404
+            
+        return jsonify({
+            'status': 'success',
+            'page': page_number,
+            'image': result
+        })
+
+    except Exception as e:
+        logger.error(f"Error in convert_pdf_page: {str(e)}")
+        cleanup_resources()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/pagecount', methods=['POST'])
+def get_page_count():
+    """Endpoint to get the total number of pages in a PDF"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+
+        pdf_file = request.files['file']
+        if not pdf_file.filename.endswith('.pdf'):
+            return jsonify({'error': 'File must be a PDF'}), 400
+
+        # Create temporary file
+        temp_pdf_path = "temp_pdf_count.pdf"
+        pdf_file.save(temp_pdf_path)
+        
+        # Get page count
+        pdf_document = fitz.open(temp_pdf_path)
+        page_count = pdf_document.page_count
+        
+        # Cleanup
+        pdf_document.close()
+        os.remove(temp_pdf_path)
+        cleanup_resources()
+        
+        return jsonify({
+            'status': 'success',
+            'pageCount': page_count
+        })
+
+    except Exception as e:
+        logger.error(f"Error in get_page_count: {str(e)}")
+        cleanup_resources()
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
