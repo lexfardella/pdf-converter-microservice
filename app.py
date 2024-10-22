@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify
 import os
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB limit
 
 def convert_pdf_to_images(pdf_bytes, dpi=300, output_format="PNG"):
     encoded_images = []
