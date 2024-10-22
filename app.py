@@ -14,35 +14,59 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB limit
 
 @dataclass
-class PageConfig:
-    max_dimension: int = 1920
-    quality: int = 85
-    format: str = "JPEG"
-
-def get_memory_usage_mb() -> float:
-    """Get current memory usage in MB"""
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1024 / 1024
+class ImageSettings:
+    dpi: int = 300               # Higher DPI for better text clarity
+    max_dimension: int = 2400    # Larger dimension to preserve detail
+    jpeg_quality: int = 95       # Higher quality to prevent artifacts
+    format: str = "PNG"          # PNG for better text clarity
+    optimize: bool = True        # Still optimize without losing quality
 
 def cleanup_memory():
     """Force garbage collection and memory cleanup"""
     gc.collect()
-    
-def process_single_page(page: fitz.Page, config: PageConfig) -> Optional[str]:
-    """Process a single page with memory management"""
+
+def get_memory_usage_mb() -> float:
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024
+
+def process_page(page: fitz.Page, settings: ImageSettings) -> Optional[str]:
+    """Process single page optimized for LLM analysis"""
     try:
-        # Calculate optimal scale based on page size
-        width, height = page.rect.width, page.rect.height
-        scale = min(config.max_dimension / max(width, height), 1.0)
+        # Calculate scale based on DPI
+        scale = settings.dpi / 72  # Convert PDF points to pixels
         matrix = fitz.Matrix(scale, scale)
         
-        # Get pixmap with minimal memory usage
+        # Get pixmap with text-optimized settings
         pix = page.get_pixmap(matrix=matrix, alpha=False)
+        
+        # Convert to PIL Image
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        
+        # Check if dimensions need scaling down for memory constraints
+        if max(img.width, img.height) > settings.max_dimension:
+            ratio = settings.max_dimension / max(img.width, img.height)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
         
         # Optimize and encode
         buffer = io.BytesIO()
-        img.save(buffer, format=config.format, optimize=True, quality=config.quality)
+        
+        if settings.format == "PNG":
+            # PNG optimization for text
+            img.save(
+                buffer,
+                format="PNG",
+                optimize=settings.optimize,
+            )
+        else:
+            # JPEG with high quality
+            img.save(
+                buffer,
+                format="JPEG",
+                quality=settings.jpeg_quality,
+                optimize=settings.optimize
+            )
+        
         img_str = base64.b64encode(buffer.getvalue()).decode()
         
         # Cleanup
@@ -52,49 +76,53 @@ def process_single_page(page: fitz.Page, config: PageConfig) -> Optional[str]:
         cleanup_memory()
         
         return img_str
+        
     except Exception as e:
         print(f"Error processing page: {str(e)}")
         return None
-    
+
 def convert_pdf_to_images(pdf_bytes: bytes) -> Dict:
-    """Convert PDF to images with careful memory management"""
-    images: List[Optional[str]] = []
-    failed_pages: List[int] = []
+    """Convert PDF to images with focus on text clarity"""
+    images: List[str] = []
     doc = None
+    settings = ImageSettings()  # Use text-optimized default settings
     
     try:
-        # Open document
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         total_pages = len(doc)
-        config = PageConfig()
         
-        # Process pages one at a time
         for page_num in range(total_pages):
             try:
-                # Load and process single page
+                print(f"Processing page {page_num + 1}/{total_pages}")
+                mem_before = get_memory_usage_mb()
+                print(f"Memory before processing: {mem_before:.1f}MB")
+                
                 page = doc.load_page(page_num)
-                img_str = process_single_page(page, config)
+                img_str = process_page(page, settings)
                 
                 if img_str:
                     images.append(img_str)
                 else:
-                    images.append(None)
-                    failed_pages.append(page_num)
+                    images.append("")
                 
                 # Cleanup after each page
                 del page
                 cleanup_memory()
                 
-                # Log memory usage
-                current_mem = get_memory_usage_mb()
-                print(f"Memory after page {page_num + 1}/{total_pages}: {current_mem:.1f}MB")
+                mem_after = get_memory_usage_mb()
+                print(f"Memory after processing: {mem_after:.1f}MB")
+                print(f"Memory change: {mem_after - mem_before:.1f}MB")
                 
             except Exception as e:
                 print(f"Error on page {page_num}: {str(e)}")
-                images.append(None)
-                failed_pages.append(page_num)
+                images.append("")
                 cleanup_memory()
                 
+        return {
+            "images": images,
+            "total_pages": total_pages
+        }
+        
     except Exception as e:
         return {
             "error": str(e),
@@ -104,13 +132,6 @@ def convert_pdf_to_images(pdf_bytes: bytes) -> Dict:
         if doc:
             doc.close()
         cleanup_memory()
-    
-    return {
-        "total_pages": len(images),
-        "images": images,
-        "failed_pages": failed_pages,
-        "memory_usage_mb": get_memory_usage_mb()
-    }
 
 @app.route('/convert', methods=['POST'])
 def handle_convert():
@@ -122,11 +143,9 @@ def handle_convert():
         return jsonify({"error": "No selected file"}), 400
     
     try:
-        # Read file and process
         pdf_bytes = file.read()
         result = convert_pdf_to_images(pdf_bytes)
         
-        # Check for errors
         if "error" in result:
             return jsonify(result), 500
             
