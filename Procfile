@@ -1,1 +1,1 @@
-web: gunicorn app:app --timeout 300 --workers 2 --threads 4 --max-requests 1000 --max-requests-jitter 50 --preload
+web: gunicorn app:app --timeout 300 --workers 1 --threads 2 --max-requests 100 --max-requests-jitter 50 --preload --limit-request-line 8192 --limit-request-field_size 1000 --log-level debug --worker-class gthread --worker-tmp-dir /dev/shm
